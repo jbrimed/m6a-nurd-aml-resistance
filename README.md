@@ -11,7 +11,7 @@ We present computational workflows supporting CRISPR screen analysis, RNA-seq di
 
 ## Summary
 
-Loss of the m⁶A methyltransferase adaptor **RBM15** and NuRD complex interactor **ZMYND8** induces resistance to BCL2 inhibitors (venetoclax and AZD4320) in AML through alterations in apoptotic balance and promotion of monocytic differentiation. In patient data, reduced activity of the m⁶A and NuRD complexes correlates with more differentiated disease states and reduced sensitivity to BCL2-family inhibitors. These findings integrate epigenetic and transcriptomic features to reveal novel mediators of drug resistance.
+Loss of the m⁶A methyltransferase adaptor **RBM15** and NuRD complex interactor **ZMYND8** induces resistance to BCL2 inhibitors (venetoclax and AZD4320) in AML through alterations in apoptotic balance and promotion of monocytic differentiation. In patient data, reduced activity of the m⁶A and NuRD complexes correlates with more differentiated disease states and reduced sensitivity to BCL2-family inhibitors. 
 
 ---
 
