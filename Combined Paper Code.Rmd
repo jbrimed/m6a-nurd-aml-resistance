@@ -1,0 +1,2140 @@
+---
+title: "Untitled"
+output: html_document
+date: "2025-06-02"
+---
+
+
+Libraries
+```{r}
+library(tidyverse)
+library(ggrepel)
+library(scales)
+library(ggprism)
+library(ggtext)
+library(patchwork)
+library(readxl)
+library(janitor)
+library(tictoc)
+library(scattermore)
+library(purrr)
+library(here)
+library(broom)
+library(future)
+library(furrr)
+library(ggbeeswarm)
+library(ggsignif)
+library(clusterProfiler)
+library(circlize)
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+library(data.table)
+library(ComplexHeatmap)
+library(cowplot)
+library(conflicted)
+library(factoextra)
+conflicts_prefer(dplyr::select)
+conflicts_prefer(dplyr::filter)
+conflicts_prefer(dplyr::rename)
+conflicts_prefer(base::as.factor)
+```
+
+
+Figure 1 Code
+```{r}
+#Figure 1B: AZD4320 vs Venetoclax AUCs
+fullauc <- read_tsv(file =
+                      here("Data_sources",
+                           "datalock",
+                           "beataml_probit_v4_nonprop_azd_withrescues.txt"))
+
+all_aplusv <- fullauc %>% filter(inhibitor %in% c("Venetoclax", "AZD4320"))
+rm(fullauc)
+
+a_samples <- all_aplusv %>% filter(inhibitor == "AZD4320") %>% pull(lab_id) %>% unique() 
+v_samples <- all_aplusv %>% filter(inhibitor == "Venetoclax") %>% pull(lab_id) %>% unique() 
+
+all_aplusv %>% 
+  filter(lab_id %in% a_samples) %>% 
+  filter(lab_id %in% v_samples) %>% 
+  identity() -> paired_samples_only
+
+wide_paired_df <- paired_samples_only %>% 
+  select(lab_id, patient_id, inhibitor, auc) %>% 
+  pivot_wider(id_cols = c(lab_id, patient_id),
+              names_from = inhibitor, values_from = auc)
+
+pair_ttest_twotail <- t.test(wide_paired_df$Venetoclax, wide_paired_df$AZD4320,
+                             paired = TRUE, alternative = "two.sided")
+pair_ttest_twotail$p.value
+
+cor_pearson <- cor.test(wide_paired_df$Venetoclax, wide_paired_df$AZD4320) # 0.7383
+p1 <- ggplot(wide_paired_df,
+         aes(x = Venetoclax, y = AZD4320)) +
+  geom_point(size = 0.5,  color = "black") +
+  geom_smooth(method=lm, se=FALSE,color= "red", linetype = "3133" )+
+  geom_text(x = 0, y = 275, 
+            label = paste0(
+              "paired t-test p value = ", signif(pair_ttest_twotail$p.value,2),
+              "\n", 
+              "pearson correlation = ", signif(cor_pearson$estimate, 2)
+            ),
+            vjust = 1, hjust = 0,size = 3) +
+  theme_prism(base_size = 10) +
+  labs(x = "Venetoclax AUC", y = "AZD4320 AUC") +
+  coord_fixed() 
+
+p1
+ggsave(here("Jackson_Messy_Code","Final Figures","AZD4320 vs Ven AUC Scatter.png"),height = 6, width = 6, dpi = 600)
+
+#Figure 1C: Comparison of genes associated with AZD4320 and Venetoclax
+bcl2_fam <- c("BCL2","BCL2L1", "BCL2L2", "MCL1", "BAX", "BCL2A1", "BAK1", "BOK", "BCL2L10","BCL2L112","BCL2L13","BCL2L14","BCL2L15", "BNIP2")
+
+longrna <- read_tsv(here("Data_sources", "datalock","beataml_waves1to4_norm_exp_dbgap_mapped.txt")) %>% 
+  dplyr::rename(expression = rpkm_cqn)
+full_drug <- read_tsv(here("Data_sources",  "datalock", "beataml_probit_v4_nonprop_azd_withrescues.txt"))
+
+both_azd_ven <- 
+  full_drug %>% 
+  select(lab_id, auc, inhibitor) %>% 
+  filter(inhibitor == "Venetoclax" |
+           inhibitor == "AZD4320") %>% 
+  pivot_wider(id_cols = lab_id, names_from = inhibitor, values_from = auc) %>% 
+  filter(!is.na(Venetoclax) & !is.na(AZD4320)) # reduces from 438 rows to 232
+
+rm(full_drug)
+
+AZD_ven_rna <- longrna %>% 
+  filter(lab_id %in% both_azd_ven$lab_id) %>% 
+  inner_join(both_azd_ven,
+             by = "lab_id")
+rm(longrna)
+
+gene_nested <- AZD_ven_rna %>% 
+  pivot_longer(cols = c(Venetoclax, AZD4320), names_to = "inhibitor",
+               values_to = "auc") %>% 
+  nest(data = c(lab_id, dbgap_rnaseq_sample, patientId, expression, auc))
+
+tic() 
+df_regressions <- gene_nested %>% 
+  mutate(test = map(data, ~cor.test(.x$expression, .x$auc, method = "spearman", exact = FALSE))) %>% 
+  mutate(tidied = map(test, broom::tidy)) %>% 
+  select(gene = display_label, inhibitor, tidied) %>% 
+  unnest(tidied)
+
+
+toc()
+
+temp_adjp <- df_regressions %>% 
+  select(gene, inhibitor, p.value) %>% 
+  mutate(fdr_p = p.adjust(p.value, 
+                          method = "fdr")) %>% 
+  select(-p.value)
+
+df_regressions_adj <- df_regressions %>% 
+  left_join(temp_adjp, by = c("gene", "inhibitor")) %>% 
+  mutate(signed_fdr = 
+           case_when(
+             estimate <=0 ~ fdr_p*-1,
+             estimate > 0 ~ fdr_p
+           ))
+
+
+df_regressions_adj %>% count(inhibitor)
+
+
+
+highlight_genes <- c("TP53", bcl2_fam,
+                     "BCL2L11", "BBC3", "PMAIP1", "BID", "BAD")
+
+highlight_genes %in% df_regressions_adj$gene
+
+vec_labels <- highlight_genes %>% 
+  str_replace("BCL2L11$", "BCL2L11 (BIM)") %>%
+  str_replace("BBC3$", "BBC3 (PUMA)") %>%
+  str_replace("BCL2L14$", "BCL2L14 (BCLG)") %>%
+  str_replace("PMAIP1$", "PMAIP (NOXA)") %>%
+  str_replace("BCL2L2$", "BCL2L2 (BCLW)")
+
+df_highlight_labels <- data.frame(highlight_genes, vec_labels)
+
+df_signed <- df_regressions_adj %>% 
+  mutate(logsigned_fdr = 
+           case_when(
+             estimate < 0 ~ -log10(fdr_p) * -1,
+             estimate >= 0 ~ -log10(fdr_p)
+           ))
+
+
+df_labeled <- df_signed %>% 
+  group_by(inhibitor) %>% 
+  arrange(log10(signed_fdr)) %>% 
+  mutate(posfdr = row_number()) %>% 
+  arrange(log10(-signed_fdr)) %>% 
+  mutate(negfdr = row_number()) %>% 
+  arrange(estimate) %>% 
+  mutate(posslope = row_number()) %>% 
+  arrange(-estimate) %>% 
+  mutate(negslope = row_number()) %>% 
+  mutate(fdr_x_slope = -log10(fdr_p) * estimate) %>% 
+  arrange(fdr_x_slope) %>% 
+  mutate(comp_fdrslope = row_number()) %>% 
+  arrange(-fdr_x_slope) %>% 
+  mutate(comp_posfdrslope = row_number()) %>% 
+  ungroup() %>% 
+  left_join(df_highlight_labels, by = c("gene" = "highlight_genes")) %>% 
+  rowwise() %>% 
+  mutate(label = 
+           case_when(
+             gene %in% df_highlight_labels$highlight_genes ~ vec_labels,
+             min(posfdr, negfdr, posslope, negslope, comp_fdrslope, comp_posfdrslope) < 11 ~ gene,
+             TRUE ~ NA_character_
+           )
+  ) %>% 
+
+  ungroup() %>% 
+  mutate(bcl2_family = gene %in% df_highlight_labels$highlight_genes & gene != "TP53")
+
+
+azVsVen <- 
+  df_labeled %>% 
+  select(gene, inhibitor, logsigned_fdr) %>% 
+  pivot_wider(id_cols = c(gene), names_from = inhibitor, values_from = logsigned_fdr) %>% 
+  left_join(df_labeled %>% 
+              select(gene, label) %>% 
+              filter(!is.na(label)) %>% 
+              distinct(),
+            by = "gene")
+
+
+linmod <- lm(AZD4320 ~ Venetoclax, azVsVen)
+
+lresids <- augment(linmod, azVsVen)
+
+summary(lresids)
+
+
+labelresids <-
+  lresids %>% 
+  mutate(resid_quadrant =
+           case_when(
+             Venetoclax > 0 ~ .resid * 1,
+             Venetoclax <= 0 ~ .resid * -1
+           )) %>% 
+  mutate(r_rank = rank(resid_quadrant)) %>% 
+  mutate(r_rank_desc = rank(-resid_quadrant)) %>% 
+  filter(r_rank < 6 | r_rank_desc < 6 |
+           gene %in% df_highlight_labels$highlight_genes |
+           gene == "SEMA4G" | gene == "IL6ST") %>% 
+  mutate(label = 
+           case_when(
+             is.na(label) ~ gene,
+             TRUE ~ label
+           )) %>% 
+  mutate(bcl2_family = gene %in% df_highlight_labels$highlight_genes & gene != "TP53")
+
+fig1c <- ggplot(azVsVen,
+       aes(x = Venetoclax, y = AZD4320)) +
+  geom_hline(yintercept = 0, 
+             alpha = 0.5) +
+  geom_vline(xintercept = 0, 
+             alpha = 0.5) +
+  geom_abline(slope = 1, intercept = 0,
+              linetype = "3133") + 
+  geom_point(size = 0.3, alpha = 0.1,
+             color = "gray30") +
+  geom_point(data = labelresids %>%
+      filter(
+        gene %in% c("BCL2", "SEMA4G", "TP53", "BCL2L1",
+                    "MCOLN1", "IL6ST", "BCL2A1", "BCL2L11")),
+             pch = 21,
+             aes(fill = resid_quadrant)) +
+  scale_fill_gradient2(low = "darkorange", mid = "white", high = "#579D1C",
+                       midpoint = 0,
+                       oob = squish,
+                       name = "",
+                       labels= c("More Correlated\nwith\nVenetoclax","More Correlated\nwith\nAZD4320"),
+                       breaks = c( -5,5))+
+  geom_label_repel(
+    data = labelresids %>%
+      filter(
+        gene %in% c("BCL2", "SEMA4G", "TP53", "BCL2L1",
+                    "MCOLN1", "IL6ST", "BCL2A1", "BCL2L11")
+        ),
+    aes(label = label,
+        fill = resid_quadrant,
+    ),
+    alpha = .85,
+    segment.color = "black",
+    max.overlaps = Inf,
+    point.padding = 0.3, min.segment.length = 0, size = 3.5) +
+  labs(
+    x = "Venetoclax: -log10(FDR)",
+    y = "AZD4320: -log10(FDR)",
+  ) +
+  theme_prism() +
+  theme(plot.subtitle = element_markdown(hjust = 0.5),
+        strip.text = element_text(size = 12, face = "bold"),
+        axis.title.x = element_markdown(),
+        axis.title.y = element_markdown(),
+        plot.title = element_markdown(hjust = 0.5),
+        axis.line = element_blank(),
+        legend.position = "none")
+
+fig1c
+
+
+
+rm(AZD_ven_rna,all_aplusv,azVsVen,temp_adjp,lresids)
+```
+
+
+Figure 2 Code
+```{r}
+#Figure 2A: Volcano plot of AZD4320 CRISPR Screen 
+d14_4320_aml2<- 
+  read_xlsx(
+    here("Data_sources", "CRISPR Screen", "marked S11_AML2_4320vsDMSO_Day14_results.xlsx"),
+    sheet = 1) %>% 
+  clean_names() %>%  
+  subset(select = c(gene, median_lfc, median_pval, tiers))  %>% 
+  na.omit() %>% 
+  mutate(screen = "4320_aml2") %>% 
+  mutate(signed_pval = -log10(median_pval)*ifelse(median_lfc <0, -1, 1))
+
+d14_ven_aml2 <- 
+ read_xlsx(
+    here("Data_sources", "CRISPR Screen", "OCI-AML2_VENvsDMSO_Day14_results.xlsx"),
+    sheet = 1) %>% 
+  clean_names() %>%  
+   subset(select = c(gene, mid_lfc, mid_pval, tiers))  %>% 
+  na.omit() %>% 
+  dplyr::rename(c(median_lfc = mid_lfc, median_pval = mid_pval)) %>% 
+  mutate(screen = "ven_aml2") %>% 
+  mutate(signed_pval = -log10(median_pval)*ifelse(median_lfc <0, -1, 1))
+
+
+tier_colors <- c(Tier1 = "red", Tier2 = "green4", Tier3 = "blue", 
+                 Singleton = "grey50", Unassigned = "grey50")
+
+s.labs <- c("4320_aml2" = "AZD4320",
+            "ven_aml2" = "Venetoclax")
+
+rawazd_fig1c <- rbind(d14_ven_aml2, d14_4320_aml2) %>% 
+  left_join(df_highlight_labels, by = c("gene" = "highlight_genes")) %>% 
+  mutate(label =
+           case_when(
+  
+             gene == "RBM15" | gene == "ZMYND8" ~ gene,
+             gene %in% df_highlight_labels$highlight_genes ~ gene,
+             TRUE ~ NA_character_
+           )) %>% 
+  filter(screen == "4320_aml2")
+
+t_counts <- rawazd_fig1c %>% count(tiers)
+  
+fig2a<- ggplot(rawazd_fig1c,
+         aes(
+           x = median_lfc, 
+           y = -log10(median_pval),
+           label = gene)
+  ) +
+    theme_prism(base_size = 10) +
+    geom_hline(yintercept = 2, linetype = "3133") +
+    geom_vline(xintercept = 0, linetype = "3133") +
+    
+    geom_point(data = rawazd_fig1c %>% filter(tiers %in% c("Unassigned", "Singleton")), 
+               aes(fill = tiers), 
+               size = 1, 
+               alpha = 0.2, 
+               color = "grey50") +
+    
+    geom_point(data = rawazd_fig1c %>% filter(!tiers %in% c("Unassigned", "Singleton")), 
+               aes(fill = tiers), 
+               size = 2, 
+               alpha = 0.7, 
+               pch = 21) +
+    
+  
+    geom_point(data = rawazd_fig1c %>% 
+                       filter(tiers == "Tier1" |
+                                gene == "BCL2L1"),
+               aes(fill = tiers),
+               pch = 21,
+               size = 3) +
+    
+    # Labels for the highlighted genes
+    geom_label_repel(data = rawazd_fig1c %>% 
+                       mutate(label = case_when(
+                         tiers == "Tier1" |
+                                gene == "BCL2L1" ~ gene,
+                         TRUE ~ ""
+                       )),
+                       # filter(tiers == "Tier1" |
+                       #          gene == "BCL2L1"),
+                     aes(label = label,
+                         color = tiers),
+                     fill = alpha(c("white"),0.7),
+                     size = 3,
+                     point.size = 2,
+                     # point.padding = 2,
+                     min.segment.length = 0,
+                     seed = 43,
+                     max.overlaps = Inf,
+                     label.padding = 0.1) +
+    
+    # Use the tier_colors object to specify colors for tiered points
+    scale_fill_manual(values = tier_colors) +
+    scale_color_manual(values = tier_colors, guide = "none") +
+    
+    guides(fill = guide_legend(override.aes = list(size = 4),
+                               title = "CRISPR Hit Tiers")) +
+    
+    labs(
+      y = "**-log10(FDR)**",
+      x = "**Log Fold Change**") +
+    
+    theme(
+      axis.title.x = element_markdown(hjust = 0.5),
+      axis.title.y = element_markdown(),
+      legend.position = "none",
+      strip.text.x = element_markdown(hjust = 0.5),
+      axis.line = element_blank(),
+      strip.background = element_blank()) +
+    
+    coord_cartesian(ylim = c(0, 7.5), xlim = c(-7, 7)) +
+    facet_wrap(~screen, scales = "free", labeller = labeller(screen = s.labs))
+
+fig2a
+
+#Figure 2B: Comparison of CRISPR screen hits between AZD4320 and Venetoclax Resistance Screens
+
+combined_screens <- rbind(d14_ven_aml2, d14_4320_aml2) %>% 
+  pivot_wider(names_from = "screen", values_from = c("median_lfc", "median_pval", "signed_pval", "tiers"))
+combined_screens <- combined_screens %>% mutate(significance = ifelse( combined_screens$median_pval_4320_aml2 <.01 & combined_screens$median_pval_ven_aml2 <.01, "both", "no"))
+
+direction_func <- function(df){
+  df %>% mutate(direction = 
+                  case_when(median_lfc_4320_aml2 <0 & median_lfc_ven_aml2 < 0 ~ "SAME", 
+                            median_lfc_4320_aml2 >0 & median_lfc_ven_aml2 > 0 ~ "SAME", 
+                            median_lfc_4320_aml2 <0 & median_lfc_ven_aml2 > 0 ~ "DIFFERENT", 
+                            median_lfc_4320_aml2 >0 & median_lfc_ven_aml2 < 0 ~ "DIFFERENT"))
+}
+
+same_directions <- combined_screens %>% filter(significance == "both") %>% direction_func()
+
+tiers <- c("Tier1", "Tier2", "Tier3")
+
+
+combined_screens$tiering <- "NA" 
+combined_screens$tiering[combined_screens$tiers_ven_aml2 %in% tiers & !(combined_screens$tiers_4320_aml2 %in% tiers)] <- "Venetoclax Tiered"
+combined_screens$tiering[combined_screens$tiers_4320_aml2  %in% tiers & !(combined_screens$tiers_ven_aml2  %in% tiers)] <- "4320 Tiered Tiered"
+combined_screens$tiering[combined_screens$tiers_4320_aml2 %in% tiers & combined_screens$tiers_ven_aml2 %in% tiers] <- "Both Tiered"
+table(combined_screens$tiering)
+
+overlap_tiered <- combined_screens %>% filter(tiering == "Both Tiered") %>% subset(select = c(gene, median_lfc_4320_aml2, median_lfc_ven_aml2))
+colnames(overlap_tiered) <- c("gene", "AZD4320", "Venetoclax")
+
+
+bcl2_fam <- 
+  read_csv(here("Data_sources", "BCL2Family_HUGO.csv"), skip = 1) %>% 
+  clean_names()
+
+highlight_genes <- c("TP53", bcl2_fam$approved_symbol,
+                     "BCL2L11", "BBC3", "PMAIP1", "BID", "BAD")
+
+vec_labels <- highlight_genes %>% 
+  str_replace("BCL2A1$", "BCL2A1 (BFL1)") %>%
+  str_replace("BCL2L11$", "BCL2L11 (BIM)") %>%
+  str_replace("BBC3$", "BBC3 (PUMA)") %>%
+  str_replace("BCL2L14$", "BCL2L14 (BCLG)") %>%
+  str_replace("PMAIP1$", "PMAIP (NOXA)") %>%
+  str_replace("BCL2L1$", "BCL2L1 (BCLX)") %>%
+  str_replace("BCL2L2$", "BCL2L2 (BCLW)")
+
+pretty_labels <- highlight_genes %>% 
+  str_replace("BCL2A1$", "BFL1") %>%
+  str_replace("BCL2L11$", "BIM") %>%
+  str_replace("BBC3$", "PUMA") %>%
+  str_replace("BCL2L14$", "BCLG") %>%
+  str_replace("PMAIP1$", "NOXA") %>%
+  str_replace("BCL2L1$", "BCLX") %>%
+  str_replace("BCL2L2$", "BCLW")
+
+df_highlight_labels <- data.frame(highlight_genes, vec_labels, pretty_labels)
+
+rawboth <- rbind(d14_ven_aml2, d14_4320_aml2) %>% 
+  left_join(df_highlight_labels, by = c("gene" = "highlight_genes")) %>% 
+  mutate(label =
+           case_when(
+             gene == "RBM15" | gene == "ZMYND8" ~ gene,
+             gene %in% df_highlight_labels$highlight_genes ~ gene,
+             TRUE ~ NA_character_
+           ))
+
+rawlong <- rawboth %>% 
+  left_join(data.frame(screen = c("4320_aml2", "ven_aml2"),
+                       lfc_type = c("AZD4320", "Venetoclax")),
+            by = "screen") %>% 
+  select(gene, vec_labels, pretty_labels, label, median_lfc, lfc_type) %>% 
+  pivot_wider(id_cols = c("gene", "vec_labels", "pretty_labels", "label"),
+              names_from = lfc_type, values_from = median_lfc)
+
+crisp_func <-  function(df){
+  df %>% mutate(direction = 
+                  case_when(AZD4320 <0 & Venetoclax < 0 ~ "SAME", 
+                            AZD4320 >0 & Venetoclax > 0 ~ "SAME", 
+                            AZD4320 <0 & Venetoclax > 0 ~ "DIFFERENT", 
+                            AZD4320 >0 & Venetoclax < 0 ~ "DIFFERENT"))
+}
+
+
+
+overlap_tiered_test <- overlap_tiered %>% crisp_func()
+direc_label <- overlap_tiered_test %>% subset(select = c(gene, direction))
+
+rawlong <- rawlong %>% left_join(direc_label, by = "gene")
+cols <- c("SAME" = "turquoise4", "DIFFERENT" = "maroon2")
+
+ rawlong_filtered <- rawlong %>% filter(!is.na(direction))
+
+ggplot(rawlong_filtered, aes(x = Venetoclax, y = AZD4320)) +
+  geom_hline(yintercept = 0, linetype = "3133", color = "grey40") +
+  geom_vline(xintercept = 0, linetype = "3133", color = "grey40") +
+  theme_prism(base_size = 10) +
+  
+  geom_point(data = rawlong %>% filter(is.na(direction)),
+             aes(x = Venetoclax, y = AZD4320),
+             size = .25, alpha = 0.4, color = "grey75") +
+  
+
+  geom_point(aes(color = direction, fill = direction, shape = direction), size = 1.5) +
+  
+  geom_label_repel(data = overlap_tiered_test,
+                   aes(label = gene,color = direction),
+                   point.size = 1.5,
+                   seed = 43,
+                   max.overlaps = Inf,
+                  fontface = "bold", size = 3,
+                  #force = 3,
+                  box.padding = 0.3
+                  ) +
+  
+  scale_fill_manual(values = c("SAME" = "turquoise4", "DIFFERENT" = "maroon2"), name = "Shared Tier Direction") +
+  scale_color_manual(values = c("SAME" = "turquoise4", "DIFFERENT" = "maroon2"), guide = "none") +
+  scale_shape_manual(values = c("SAME" = 21, "DIFFERENT" = 24), name = "Shared Tier Direction") +
+  
+  labs(x = "Venetoclax screen LFC", y = "AZD4320 screen LFC") +
+  scale_x_continuous(breaks = seq(from = -7.5, to = 7.5, by = 2.5),
+                     labels = c('', '-5', '', '0', '', '5', '')) +
+  scale_y_continuous(breaks = seq(from = -5, to = 7.5, by = 2.5),
+                     labels = c('-5', '', '0', '', '5', '')) +
+  
+  guides(fill = guide_legend(override.aes = list(size = 5), title = "Shared Tier Direction")) +
+  
+  theme(axis.line = element_blank(), 
+        legend.position = "bottom")
+
+
+rm(combined_screens,df_regressions,df_regressions_adj,linmod,rawboth,rawlong,fig1c,fig2a,d14_4320_aml2,d14_ven_aml2)
+```
+
+
+
+Figure 3 Code
+```{r}
+#Figure 3A: BCL2 family ratio comparison 
+ratios_long_df <- read_rds(file = here("Kevin_Messy_Code",
+                      "bcl_ratios_normalized_long.rds"))
+
+wide_toplot <- ratios_long_df %>%
+  select(name, cline, SYMBOL.x, value.x) %>%
+  distinct() %>%
+  pivot_wider(names_from = SYMBOL.x, values_from = value.x) %>%
+  mutate(
+    xpos = case_when(
+      cline == "Parental" ~ 1,
+      cline == "NTg1" ~ 1.8,
+      cline == "NTg2" ~ 2.2,
+      cline == "RBM15g1" ~ 2.8,
+      cline == "RBM15g2" ~ 3.2,
+      cline == "ZMYND8g1" ~ 3.8,
+      cline == "ZMYND8g3" ~ 4.2
+    ),
+    category = case_when(
+      str_detect(cline, "Parental") ~ "Parental",
+      str_detect(cline, "NTg") ~ "NT",
+      str_detect(cline, "RBM") ~ "RBM15",
+      str_detect(cline, "ZMY") ~ "ZMYND8"
+    )
+  )
+
+# Define a function to compute p-value and plot each ratio
+plot_bcl2_ratio <- function(df, y_expr, comp_groups, y_label, y_position, x_min, x_max) {
+  ratio_var <- rlang::sym(y_expr)
+
+  pval <- df %>%
+    mutate(ratio = !!rlang::parse_expr(y_expr)) %>%
+    filter(category %in% comp_groups) %>%
+    select(name, category, ratio) %>%
+    t.test(ratio ~ category, data = ., alternative = "two.sided") %>%
+    .$p.value
+
+  annotation <- if (pval < 0.0001) "p<0.0001" else paste0("p=", round(pval, 4))
+
+  # Plot
+  df %>%
+    filter(category != "Parental") %>%
+    ggplot(aes(x = xpos, y = !!rlang::parse_expr(y_expr), group = xpos, color = category)) +
+    geom_boxplot(outlier.shape = NA, linewidth = 0.25) +
+    geom_quasirandom(width = 0.05) +
+    scale_color_manual(values = c("NT" = "black", "RBM15" = "#0084D1", "ZMYND8" = "#FFD320")) +
+    scale_x_continuous(breaks = c(1, 2, 3, 4), labels = c("Parental", "NT", "RBM15", "ZMYND8")) +
+    coord_cartesian(clip = "off") +
+    geom_signif(y_position = y_position, xmin = x_min, xmax = x_max, annotation = annotation) +
+    labs(y = y_label) +
+    theme_classic() +
+    theme(axis.title.x = element_blank(), legend.position = "none")
+}
+
+# Generate plots
+plot_bcl2_ratio(wide_toplot, "BCL2 / BCL2A1", c("NT", "ZMYND8"), "Expression (BCL2 / BCL2A1)", 59, 2, 4)
+plot_bcl2_ratio(wide_toplot, "BCL2 / MCL1", c("NT", "ZMYND8"), "Expression (BCL2 / MCL1)", 1.5, 2, 4)
+plot_bcl2_ratio(wide_toplot, "BCL2 / BAX", c("NT", "ZMYND8"), "Expression (BCL2 / BAX)", 3.5, 2, 4)
+plot_bcl2_ratio(wide_toplot, "BCL2 / BCL2L11", c("NT", "RBM15"), "Expression (BCL2 / BIM)", 4.5, 2, 3)
+plot_bcl2_ratio(wide_toplot, "BCL2L1 / BCL2L11", c("NT", "RBM15"), "Expression (BCL2L1 / BIM)", 0.185, 2, 3)
+
+
+# Figure 3B: Cell Type Enrichment of RBM15 and ZMYND8 Knockouts
+
+nt_vs_rbm15 <- read_xlsx(here("Jackson_Messy_Code", "Pooled_DESeq2_Results.xlsx"),
+                         sheet = "NT_vs_RBM15") %>%
+  dplyr::rename(gene_id = ENSG, logFC = log2FoldChange, fdr = padj)
+
+nt_vs_zmynd8 <- read_xlsx(here("Jackson_Messy_Code", "Pooled_DESeq2_Results.xlsx"),
+                          sheet = "NT_vs_ZMYND8") %>%
+  dplyr::rename(gene_id = ENSG, logFC = log2FoldChange, fdr = padj)
+
+longrna_de <- bind_rows(
+  nt_vs_rbm15 %>% mutate(experiment = "RBM15"),
+  nt_vs_zmynd8 %>% mutate(experiment = "ZMYND8")
+) %>% mutate(pos_foldchange = logFC >= 0)
+
+longrna_de %>%
+  filter(!is.na(fdr)) %>%
+  group_by(experiment, pos_foldchange) %>%
+  summarise(
+    p05 = sum(fdr < 0.05),
+    p01 = sum(fdr < 0.01),
+    p001 = sum(fdr < 0.001),
+    .groups = "drop"
+  )
+
+panglao_markers <- read_tsv(here("Data_sources", "datalock","PanglaoDB_markers_27_Mar_2020.tsv")) %>%
+  filter(species == c("Hs", "Mm Hs")) %>%
+  clean_names() %>%
+  select(official_gene_symbol, cell_type) %>%
+  distinct() %>%
+  dplyr::rename(gene = official_gene_symbol)
+
+panglao_markers$entrez_gene <- mapIds(
+  org.Hs.eg.db,
+  keys = panglao_markers$gene,
+  column = "ENTREZID",
+  keytype = "SYMBOL",
+  multiVals = "first"
+)
+
+panglao_markers <- panglao_markers %>%
+  filter(!is.na(entrez_gene)) %>%
+  dplyr::select(gs_name = cell_type, entrez_gene) %>%
+  distinct()
+
+# Prepare helper functions
+prepare_data_for_analysis <- function(res_df) {
+  res_df$ENTREZID <- mapIds(
+    org.Hs.eg.db,
+    keys = res_df$gene_id,
+    column = "ENTREZID",
+    keytype = "ENSEMBL",
+    multiVals = "first"
+  )
+  res_df <- res_df %>%
+    filter(!is.na(ENTREZID)) %>%
+    distinct(ENTREZID, .keep_all = TRUE)
+  gene_list <- res_df$logFC
+  names(gene_list) <- res_df$ENTREZID
+  sort(gene_list, decreasing = TRUE)
+}
+
+perform_gsea_for_cell_types <- function(gene_list, term2gene) {
+  GSEA(
+    geneList = gene_list,
+    TERM2GENE = term2gene,
+    pvalueCutoff = 0.05,
+    verbose = FALSE
+  )
+}
+
+# Run GSEA
+gene_list_rbm15 <- prepare_data_for_analysis(nt_vs_rbm15)
+gene_list_zmynd8 <- prepare_data_for_analysis(nt_vs_zmynd8)
+
+gsea_rbm15 <- perform_gsea_for_cell_types(gene_list_rbm15, panglao_markers)
+gsea_zmynd8 <- perform_gsea_for_cell_types(gene_list_zmynd8, panglao_markers)
+
+# Visualize results inline
+library(enrichplot)
+library(ggprism)
+
+# Dotplot and ridgeplot for RBM15
+dotplot(gsea_rbm15, showCategory = 20, split = ".sign") +
+  facet_grid(. ~ .sign) +
+  ggtitle("Cell Type Enrichment - NT_vs_RBM15") +
+  theme_prism(base_size = 12)
+
+ridgeplot(gsea_rbm15, showCategory = 20) +
+  ggtitle("Cell Type Enrichment Ridgeplot - NT_vs_RBM15") +
+  theme_prism(base_size = 12)
+
+# Dotplot and ridgeplot for ZMYND8
+dotplot(gsea_zmynd8, showCategory = 20, split = ".sign") +
+  facet_grid(. ~ .sign) +
+  ggtitle("Cell Type Enrichment - NT_vs_ZMYND8") +
+  theme_prism(base_size = 12)
+
+ridgeplot(gsea_zmynd8, showCategory = 20) +
+  ggtitle("Cell Type Enrichment Ridgeplot - NT_vs_ZMYND8") +
+  theme_prism(base_size = 12)
+
+rm(gsea_rbm15,gsea_zmynd8,longrna_de,nt_vs_rbm15,nt_vs_zmynd8,rawazd_fig1c,df_signed,df_labeled)
+
+```
+
+
+Figure 4
+```{r}
+# Figure 4A: Heatmaps of RBM15 and ZMYND8 Associations
+# Load RNA expression data for RBM15 and ZMYND8
+longrna <- read_delim(here("Data_sources", "beat aml data", "beataml_waves1to4_norm.txt")) %>%
+  pivot_longer(cols = !c(stable_id, display_label, description, biotype),
+               names_to = "lab_id",
+               values_to = "expression") %>% 
+  subset(select = -c(stable_id, description, biotype)) %>% 
+  rename(gene = "display_label") %>%
+  filter(gene %in% c("RBM15", "ZMYND8")) %>%
+  na.omit() 
+
+# Load and filter cell type data
+group_data <- read_tsv(here("Data_sources", "datalock", "beataml_wv1to4_clinical_git_mapped.tsv")) %>%
+  clean_names() %>%
+  filter(manuscript_rnaseq == "yes")
+
+vg_score <- read_delim(here("Data_sources", "datalock", "beataml2_vg_scores_mapped.txt")) %>%
+  mutate(ptid = str_remove(ptid, "pt")) %>%
+  select(lab_id, vg_type, PC1)
+
+# Combine cell type data with RNA expression
+beat_1_4_df <- left_join(group_data, vg_score, by = "lab_id") %>%
+  left_join(longrna, by = "lab_id") %>% select(lab_id, vg_type, PC1,gene, expression)
+
+cell_type_long <- beat_1_4_df %>%
+  group_by(vg_type, gene) %>%
+  nest() %>%
+  mutate(cor_result = map(data, ~ cor.test(.x$PC1, .x$expression, method = "spearman", exact = FALSE)),
+         tidy_result = map(cor_result, tidy)) %>%
+  unnest(tidy_result) %>%
+  select(vg_type, gene, estimate,p.value)
+
+
+# Create cell type correlation heatmap
+cell_type_matrix <- cell_type_long %>%
+  select(-p.value) %>% 
+  pivot_wider(names_from = gene, values_from = estimate) %>%
+  column_to_rownames(var = "vg_type") %>%
+  as.matrix()
+
+
+
+p_value_matrix <- cell_type_long %>%
+  select(vg_type, gene, p.value) %>%
+  pivot_wider(names_from = gene, values_from = p.value) %>%
+  column_to_rownames(var = "vg_type") %>%
+  as.matrix()
+
+p_value_to_stars <- function(p) {
+  if (p < 0.001) {
+    return("***")
+  } else if (p < 0.01) {
+    return("**")
+  } else if (p < 0.05) {
+    return("*")
+  } else {
+    return("")
+  }
+}
+
+p_value_legend <- Legend(
+  labels = c("*** p < 0.001", "** p < 0.01", "* p < 0.05"),
+  legend_gp = gpar(fontsize = 10),
+  title = "P-value Significance",
+  title_gp = gpar(fontsize = 12, fontface = "bold")
+)
+
+annotation_cell <- rowAnnotation(
+    foo = anno_block(
+        gp = gpar(fill = "purple"), # Fill color for the block
+        labels = "Cell State", # Label for the block annotation
+        labels_gp = gpar(col = "white", fontsize = 12, fontface = "bold") # Customize label appearance
+    )
+)
+
+color_ramp <- colorRamp2(c(-1, 0, 1), c("navy", "white", "red"))
+
+ht_opt(
+    legend_title_gp = gpar(fontsize = 12, fontface = "bold"), # Make legend title bold
+    legend_labels_gp = gpar(fontsize = 12), # Set legend labels size
+    heatmap_row_names_gp = gpar(fontsize = 12, fontface = "bold"), # Make row names bold
+    heatmap_column_names_gp = gpar(fontsize = 12, fontface = "bold"), # Make column names bold
+    heatmap_column_title_gp = gpar(fontsize = 12, fontface = "bold") # Make column titles bold
+)
+
+cell_type_heat <- Heatmap(
+  cell_type_matrix, 
+  name = "Spearman\nCorrelation",
+  col = colorRamp2(c(-1, 0, 1), c("navy", "white", "red")),
+  left_annotation = annotation_cell,
+  width = unit(6, "cm"), 
+  height = unit(8, "cm"), 
+  rect_gp = gpar(col = "white"),
+  row_names_gp = gpar(fontface = "bold"), 
+  column_names_gp = gpar(fontface = "bold"),
+  cluster_columns = FALSE,
+  cluster_rows = FALSE,
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    # Convert p-values to stars and annotate the cells
+    stars <- p_value_to_stars(p_value_matrix[i, j])
+    grid.text(stars, x, y, gp = gpar(fontsize = 10, col = "black"))
+  },
+  heatmap_legend_param = list(
+    title = "Spearman\nCorrelation", 
+    at = c(-1, 0, 1),
+    direction = "horizontal",  
+    title_position = "topcenter", 
+    title_gp = gpar(fontsize = 12, fontface = "bold")
+  )
+)
+
+
+
+
+group_data <- read_tsv(here("Data_sources", "datalock", "beataml_wv1to4_clinical_git_mapped.tsv"), col_names = TRUE) %>% clean_names()
+
+group_data <- group_data %>% filter(manuscript_rnaseq == "yes")
+
+beat_1_4_raw <- group_data
+
+rm(group_data)
+
+#split into categorical and non categorical data
+beat_1_4_cat <- beat_1_4_raw %>% select(c(lab_id, consensus_sex, is_denovo, is_transformed))
+
+beat_1_4_cat$trans_vs_denovo <-  ifelse(beat_1_4_cat$is_denovo == TRUE, "denovo", ifelse(beat_1_4_cat$is_transformed == TRUE, "transformed", NA))
+
+beat_1_4_cat <- beat_1_4_cat %>% subset(select = -c(is_denovo, is_transformed))
+
+beat_1_4_cat[,-1] <- beat_1_4_cat[-1] %>% mutate_if(is.character, as.factor)
+
+beat_1_4_cat <- beat_1_4_cat %>% left_join(longrna, by = "lab_id") %>%  pivot_longer(cols = consensus_sex:trans_vs_denovo, names_to = "clin_measure", values_to = "clin_val") %>% group_by(gene, clin_measure) %>% nest()
+
+beat_1_4_cat <-  beat_1_4_cat %>% mutate(filtered = map(data, ~ filter(., clin_val !="unknown" | clin_val != NA)))
+
+cat_regs <- as_tibble(beat_1_4_cat) %>%  mutate(fit = map(filtered, ~glm(clin_val~ expression, data = .x, family = "binomial")), tidied = map(fit, tidy)) %>% unnest(tidied) %>% subset(select =-c(filtered, fit,data, estimate)) %>% filter(term != "(Intercept)") %>% pivot_wider(id_cols = clin_measure, names_from = gene, values_from = c(statistic, p.value))
+
+eln_cat <- beat_1_4_raw %>% select(c(lab_id, eln2017)) %>% filter(eln2017 == "Favorable" | eln2017 == "Adverse") 
+
+eln_cat[,2]<- eln_cat[,2] %>% mutate_if(is.character, as.factor)
+
+eln_cat <- eln_cat  %>% left_join(longrna, by = "lab_id") %>%  group_by(gene) %>% nest() 
+
+
+eln_reg <- eln_cat %>% mutate(fit = map(data, ~glm(eln2017 ~ expression, data = .x, family = "binomial")), tidied = map(fit, tidy)) %>% unnest(tidied) %>% subset(select =-c(fit,data, estimate))%>% filter(term != "(Intercept)") %>% pivot_wider(id_cols = term, names_from = gene, values_from = c(statistic, p.value)) 
+
+eln_reg[1,1] <- "ELN 2017 Favorable vs Adverse"
+
+eln_reg <- eln_reg %>% select(-starts_with("p.value")) %>% remove_rownames() %>% column_to_rownames(var = "term")
+
+colnames(eln_reg) <- c("ZMYND8", "RBM15")
+
+cat_regs <- cat_regs %>% select(-starts_with("p.value")) %>% remove_rownames() %>% column_to_rownames(var = "clin_measure")
+
+colnames(cat_regs) <- c("ZMYND8", "RBM15")
+
+rownames(cat_regs) <- c("Sex", "Transformed vs Denovo")
+
+
+beat_1_4_cont <- beat_1_4_raw %>% select(c(lab_id, percent_neutrophils_in_pb, percent_monocytes_in_pb, age_at_specimen_acquisition, wbc_count, percent_blasts_in_pb))
+
+beat_1_4_cont <-  beat_1_4_cont %>% mutate_at(vars(percent_neutrophils_in_pb:percent_blasts_in_pb), as.numeric)
+
+beat_1_4_cont <- beat_1_4_cont %>% left_join(longrna, by = "lab_id")  %>% pivot_longer(cols = percent_neutrophils_in_pb:percent_blasts_in_pb, names_to = "clin_measure", values_to = "clin_val") %>%  group_by(gene, clin_measure) %>% nest()
+
+cont_regs <- as_tibble(beat_1_4_cont) %>%  mutate(fit = map(data, ~lm(clin_val ~ expression, data = .x)), tidied = map(fit, tidy)) %>% unnest(tidied) %>%  filter(term == "expression") %>% subset(select = c(gene, clin_measure, term, estimate, statistic, p.value))
+
+
+cont_regs <- cont_regs %>% subset(select = -c(term, p.value, estimate)) %>% pivot_wider(id_cols = clin_measure, names_from = gene, values_from = statistic) %>% remove_rownames() %>% column_to_rownames(var = "clin_measure")
+
+rownames(cont_regs) <- c("Percent Neutrophils in PB", "Percent Monocytes in PB", "Age", "WBC Count", "Percent Blasts in PB")
+
+cont_regs$variable_type <- "Continuous"
+
+
+all_cat_reg <- rbind(eln_reg, cat_regs)
+
+all_cat_reg$variable_type <- "Categorical"
+
+all_var_table <- rbind(all_cat_reg, cont_regs)
+
+
+eln_reg_p_values <- eln_cat %>%
+  mutate(fit = map(data, ~glm(eln2017 ~ expression, data = .x, family = "binomial")), tidied = map(fit, tidy)) %>%
+  unnest(tidied) %>%
+  filter(term != "(Intercept)") %>%
+  pivot_wider(id_cols = term, names_from = gene, values_from = p.value)
+
+eln_reg_p_values[1,1] <- "ELN 2017 Favorable vs Adverse"
+eln_reg_p_values <- eln_reg_p_values %>%
+  remove_rownames() %>%
+  column_to_rownames(var = "term")
+
+colnames(eln_reg_p_values) <- c("ZMYND8", "RBM15")
+
+cat_regs_p_values <- as_tibble(beat_1_4_cat) %>%  
+  mutate(fit = map(filtered, ~glm(clin_val ~ expression, data = .x, family = "binomial")), 
+         tidied = map(fit, tidy)) %>% 
+  unnest(tidied) %>%
+  filter(term != "(Intercept)") %>%
+  pivot_wider(id_cols = clin_measure, names_from = gene, values_from = p.value) %>%
+  remove_rownames() %>%
+  column_to_rownames(var = "clin_measure")
+
+colnames(cat_regs_p_values) <- c("ZMYND8", "RBM15")
+
+cont_regs_p_values <- as_tibble(beat_1_4_cont) %>%
+  mutate(fit = map(data, ~lm(clin_val ~ expression, data = .x)), 
+         tidied = map(fit, tidy)) %>%
+  unnest(tidied) %>%
+  filter(term == "expression") %>%
+  select(clin_measure, gene, p.value) %>%
+  pivot_wider(id_cols = clin_measure, names_from = gene, values_from = p.value) %>%
+  remove_rownames() %>%
+  column_to_rownames(var = "clin_measure")
+
+rownames(cont_regs_p_values) <- c("Percent Neutrophils in PB", "Percent Monocytes in PB", "Age", "WBC Count", "Percent Blasts in PB")
+
+all_cat_reg_p_values <- rbind(eln_reg_p_values, cat_regs_p_values)
+all_var_p_values <- rbind(all_cat_reg_p_values, cont_regs_p_values)
+
+# Creating a block-style annotation for the rows using anno_block
+annotation_block <- rowAnnotation(
+    foo = anno_block(
+        gp = gpar(fill = c("red", "orange")), # Fill the blocks with the appropriate colors
+        labels = c("Continuous", "Categorical"), # Labels for the block annotation
+        labels_gp = gpar(col = "white", fontsize = 12, fontface = "bold") # Customize label appearance
+    )
+)
+
+# Use the block-style annotation in your heatmap
+gene_complex_heat <- Heatmap(
+  all_var_table[, 1:2] %>% as.matrix(),
+  name = "T or Z Statistic",
+  left_annotation = annotation_block, # Add block annotation
+  row_split = all_var_table$variable_type, # Split rows into "Continuous" and "Categorical"
+  heatmap_legend_param = list(
+    title = "T or\nZ Statistic", 
+    direction = "horizontal", 
+    title_position = "topcenter", 
+    title_gp = gpar(fontsize = 12, fontface = "bold")
+  ),
+  col = colorRamp2(c(-5, 0, 5), c("blue", "white", "red")), # Use the same color scale
+  width = unit(6, "cm"), 
+  height = unit(8, "cm"), 
+  rect_gp = gpar(col = "white"),
+  row_names_gp = gpar(fontface = "bold"), 
+  column_names_gp = gpar(fontface = "bold"),
+  row_title = NULL,
+  cluster_columns = FALSE,
+  cluster_rows = FALSE,
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    # Convert p-values to stars and annotate cells
+    stars <- p_value_to_stars(all_var_p_values[i, j])
+    grid.text(stars, x, y, gp = gpar(fontsize = 10, col = "black"))
+  }
+)
+   
+
+draw(gene_complex_heat)
+
+
+p3 = cell_type_heat %v% gene_complex_heat
+
+
+draw(p3,merge_legend = TRUE,annotation_legend_list = list(p_value_legend))
+dev.off()
+
+# Figure 4B: Volcano Plot of % Monocytes vs AUC
+all_probit_curve <- read_delim(here("Data_sources", "datalock", "beataml_probit_v4_nonprop_azd.txt")) %>%
+  clean_names() %>% 
+filter(inhibitor !="F_S_V")
+
+# Get just the column names
+col_names <- names(fread(here("Data_sources", "datalock", "beataml_wv1to4_clinical_git_mapped.tsv"), nrows = 0))
+
+# Identify only the needed columns
+cols_to_read <- which(col_names %in% c("lab_id", "%.Monocytes.in.PB"))
+
+# fread only those
+monocytic_list <- fread(
+  here("Data_sources", "datalock", "beataml_wv1to4_clinical_git_mapped.tsv"),
+  select = cols_to_read,
+  fill = TRUE,
+  quote = "",
+  showProgress = FALSE
+) %>%
+  janitor::clean_names() %>%
+  mutate(percent_monocytes_in_pb = as.numeric(gsub("[^0-9\\.]", "", percent_monocytes_in_pb))) %>%
+  na.omit()
+#monocytic_list <- fread(here("Data_sources", "datalock", "beataml_wv1to4_clinical_git_mapped.tsv")) %>%
+  #clean_names() %>%
+ # select(lab_id, percent_monocytes_in_pb) %>%
+  #na.omit()
+
+mono_all_drugs <- left_join(monocytic_list, all_probit_curve, by = "lab_id") %>%
+  na.omit() %>%
+  group_by(inhibitor) %>%
+  nest()
+
+mono_all_drugs <- mono_all_drugs %>%
+  mutate(test = map(data, ~ cor.test(.x$percent_monocytes_in_pb, .x$auc, method = "spearman", exact = FALSE)),
+         tidied = map(test, tidy)) %>%
+  unnest(tidied) %>%
+  select(inhibitor, estimate, p.value) %>%
+  mutate(fdr = p.adjust(p.value, method = "fdr")) %>%
+  filter(inhibitor != "Everolimus")
+
+drug_list <- c("Trametinib (GSK1120212)", "Trametinib - OTX-015", "Venetoclax", "Venetoclax - JQ1", "Venetoclax - Palbociclib", "AZD4320",
+               "Rapamycin", "Azacytidine - Venetoclax", "Panobinostat")
+
+ggplot(mono_all_drugs, aes(x = estimate, y = -log10(fdr))) +
+  geom_point(alpha = .6, color = "black", size = 3) +
+  geom_point(data = subset(mono_all_drugs, fdr < .05), aes(fill = estimate), shape = 21, size = 3) +
+  scale_fill_gradient2(low = "royalblue", mid = "white", high = "red", midpoint = 0, limits = c(-.7, .7)) +
+  geom_vline(xintercept = 0, linetype = "3133", color = "gray50") +
+  geom_hline(yintercept = 1.3, linetype = "3133", color = "gray50") +
+  geom_label_repel(data = filter(mono_all_drugs, inhibitor %in% drug_list),
+                   aes(label = inhibitor), color = "black", size = 3, fontface = "bold", fill = alpha("white", 0.5), label.size = NA) +
+  labs(x = "Spearman Correlation (% Monocytes ~ AUC)", y = "-log10 (FDR)") +
+  theme_prism(base_size = 10) +
+  theme(legend.position = "none")
+
+# Figure 4C: RBM15 and ZMYND8 Expression vs AZD4320 and Venetoclax AUC
+all_probit_curve <- read_delim(here("Data_sources", "datalock", "beataml_probit_v4_nonprop_azd.txt")) %>%
+  clean_names() %>%
+  filter(inhibitor %in% c("Venetoclax", "AZD4320")) %>%
+  select(lab_id, inhibitor, auc)
+
+aml_rna <- read_delim(here("Data_sources", "datalock", "beataml_waves1to4_norm_exp_dbgap_mapped.txt")) %>%
+  rename(expression = rpkm_cqn) %>%
+  clean_names()
+
+filt_rna <- aml_rna %>%
+  filter(display_label %in% c("RBM15", "ZMYND8")) %>%
+  rename(gene = display_label) %>%
+  select(lab_id, gene, expression)
+
+rm(aml_rna)
+
+rna_drugs <- left_join(all_probit_curve, filt_rna, by = "lab_id") %>% na.omit()
+
+
+# Helper function (place earlier in your Rmd)
+plot_single <- function(df, drug, gene, label, fill_color) {
+  ggplot(df %>% filter(inhibitor == drug, gene == gene), aes(x = expression, y = auc)) +
+    geom_point(size = 1.5, alpha = 0.6, pch = 21, color = "black", fill = fill_color) +
+    geom_smooth(method = "lm", se = FALSE, linetype = "solid", color = "black", size = 0.5) +
+    labs(x = paste(gene, "RPKM"), y = ifelse(drug == "Venetoclax" & gene == "RBM15", "Venetoclax AUC", ifelse(gene == "RBM15", paste(drug, "AUC"), ""))) +
+    theme_prism(base_size = 6) +
+    theme(axis.text = element_text(size = 9), axis.title = element_text(size = 10, face = "bold")) +
+    geom_text(aes(x = mean(expression), y = max(auc) * 1.1, label = label), size = 3.5, fontface = "bold", hjust = 0.5)
+}
+
+# Generate and print combined plot
+combined_plot <- plot_grid(
+  plot_single(rna_drugs, "AZD4320", "RBM15", "ρ = -0.11, FDR = 0.094", "#0084D1"),
+  plot_single(rna_drugs, "AZD4320", "ZMYND8", "ρ = -0.15, FDR < .02", "#FFD320"),
+  plot_single(rna_drugs, "Venetoclax", "RBM15", "ρ = -0.009, FDR = 0.85", "#0084D1"),
+  plot_single(rna_drugs, "Venetoclax", "ZMYND8", "ρ = -0.14, FDR < .004", "#FFD320"),
+  ncol = 2
+)
+
+print(combined_plot)
+
+#rm(longrna,annotation_cell,gene_nested,p_value_legend,filt_rna,vg_score)
+
+```
+
+
+```{r}
+# === Scatter Plots: Expression vs % Monocytes in PB ===
+expr_clin <- beat_1_4_raw %>%
+  select(lab_id, percent_monocytes_in_pb) %>%
+  mutate(percent_monocytes_in_pb = as.numeric(percent_monocytes_in_pb)) %>%
+  left_join(longrna, by = "lab_id") %>%
+  filter(gene %in% c("RBM15", "ZMYND8")) %>%
+  drop_na(percent_monocytes_in_pb, expression)
+
+monocyte_pb_plots <- expr_clin %>%
+  group_by(gene) %>%
+  group_map(~{
+    ggplot(.x, aes(x = expression, y = percent_monocytes_in_pb)) +
+      geom_point(alpha = 0.6) +
+      geom_smooth(method = "lm", se = FALSE, color = "black", linetype = "dashed") +
+      labs(
+        title = paste(.y$gene, "vs % Monocytes in PB"),
+        x = "Expression",
+        y = "% Monocytes in PB"
+      ) +
+      theme_prism(base_size = 12)
+  })
+
+# === Scatter Plots: Expression vs PC1 Scores for Cell States ===
+expr_vg <- vg_score %>%
+  filter(vg_type %in% c("Monocyte-like", "Progenitor-like")) %>%
+  left_join(longrna, by = "lab_id") %>%
+  filter(gene %in% c("RBM15", "ZMYND8")) %>%
+  drop_na(PC1, expression)
+
+plot_celltype_expr <- function(celltype_label) {
+  expr_vg %>%
+    filter(vg_type == celltype_label) %>%
+    group_by(gene) %>%
+    group_map(~{
+      ggplot(.x, aes(x = expression, y = PC1)) +
+        geom_point(alpha = 0.6) +
+        geom_smooth(method = "lm", se = FALSE, color = "black", linetype = "dashed") +
+        labs(
+          title = paste(.y$gene, "vs", celltype_label, "Score"),
+          x = "Expression",
+          y = paste("PC1 (", celltype_label, ")", sep = "")
+        ) +
+        theme_prism(base_size = 12)
+    })
+}
+
+monocyte_like_plots <- plot_celltype_expr("Monocyte-like")
+progenitor_like_plots <- plot_celltype_expr("Progenitor-like")
+
+# === Show all plots ===
+monocyte_pb_plots
+monocyte_like_plots
+progenitor_like_plots
+
+# Save % Monocytes in PB vs Expression
+ggsave(
+  filename = here("Jackson_Messy_Code", "Supplemental Figures", "RBM15_vs_MonocytesPB.png"),
+  plot = monocyte_pb_plots[[1]],
+  width = 4.5, height = 4, dpi = 600
+)
+
+ggsave(
+  filename = here("Jackson_Messy_Code", "Supplemental Figures", "ZMYND8_vs_MonocytesPB.png"),
+  plot = monocyte_pb_plots[[2]],
+  width = 4.5, height = 4, dpi = 600
+)
+
+# Save Monocyte-like PC1 vs Expression
+ggsave(
+  filename = here("Jackson_Messy_Code", "Supplemental Figures", "RBM15_vs_MonocyteLike_PC1.png"),
+  plot = monocyte_like_plots[[1]],
+  width = 4.5, height = 4, dpi = 600
+)
+
+ggsave(
+  filename = here("Jackson_Messy_Code", "Supplemental Figures", "ZMYND8_vs_MonocyteLike_PC1.png"),
+  plot = monocyte_like_plots[[2]],
+  width = 4.5, height = 4, dpi = 600
+)
+
+# Save Progenitor-like PC1 vs Expression
+ggsave(
+  filename = here("Jackson_Messy_Code", "Supplemental Figures", "RBM15_vs_ProgenitorLike_PC1.png"),
+  plot = progenitor_like_plots[[1]],
+  width = 4.5, height = 4, dpi = 600
+)
+
+ggsave(
+  filename = here("Jackson_Messy_Code", "Supplemental Figures", "ZMYND8_vs_ProgenitorLike_PC1.png"),
+  plot = progenitor_like_plots[[2]],
+  width = 4.5, height = 4, dpi = 600
+)
+```
+
+
+Figure 5 Code 
+```{r}
+#figure 5a: M6a PCA biplots of protein expression
+raw_protein_df <- read_delim(here("Data_sources","datalock","proteomics_syn25808020_20220727_long.txt"), col_names = TRUE) %>%  clean_names() %>% pivot_longer(cols = 2:7085, names_to = "gene", values_to = "expression")
+
+raw_protein_df$gene <- raw_protein_df$gene %>% toupper()
+
+m6a_genes <- c("METTL3", "METTL14", "WTAP", "RBM15", "RBM15B", "METTL16", "KIAA1429", "ZC3H13", "IGF2BP1", "IGF2BP3", "YTHDC1", "YTHDC2", "YTHDF1", "YTHDF2", "YTHDF3", "HNRNPC", "HNRNPA2BP1", "FTO", "ALKBH5", "RBMX","IGF2BP2")
+
+drug_sample <- fread(here("Data_sources", "datalock", "beataml_wv1to4_clinical_git_mapped.tsv")) %>% clean_names() %>% filter(analysis_drug =="y")
+
+
+raw_protein_df <- raw_protein_df%>% filter(lab_id %in% drug_sample$lab_id)
+
+pro_matrix <- raw_protein_df %>% 
+  filter(gene %in% m6a_genes) %>% 
+  select(gene, lab_id, expression) %>% 
+  pivot_wider(id_cols = c("lab_id"), names_from = gene, values_from = expression)
+
+rm(raw_protein_df,drug_sample)
+
+pro_mat <- pro_matrix %>%  remove_rownames() %>% column_to_rownames(var = "lab_id")
+
+
+
+m6a_pro_pca <- prcomp(pro_mat, center = TRUE, scale = TRUE)
+
+
+dat <- facto_summarize(m6a_pro_pca, element = "var", axes = c(1, 2), result = c("coord", "contrib", "cos2") )
+
+fviz_pca_var(
+  m6a_pro_pca, 
+  geom = "arrow",
+  alpha.var = 0.7,
+   col.var = "contrib",
+    repel = TRUE, 
+  circle = FALSE,
+  gradient.cols = c("blue", "red"),
+    legend.title = list(color = "Contribution (%)"),
+ ggtheme = theme_prism(base_size = 6)
+) +
+  geom_text_repel(
+        data = dat,
+        aes(x = Dim.1, y = Dim.2, label = name),
+        parse = TRUE,
+        size = 3
+    )+
+  labs(title = "NURD Protein PCA")+
+   theme( axis.line = element_blank(),
+         legend.text = element_text(face = "bold"),
+     legend.position = c(0.2, 0.2),  # Adjust position within plot area
+    legend.title = element_text(face = "bold"),
+  legend.direction = "horizontal")
+
+pca_vals<- m6a_pro_pca$x %>% as.data.frame() %>%  rownames_to_column(var = "lab_id")
+
+
+```
+
+
+```{r}
+# Load and filter cell type data
+group_data <- fread(here("Data_sources", "datalock", "beataml_wv1to4_clinical_git_mapped.tsv")) %>%
+  clean_names() %>%
+  filter(used_manuscript_analyses == "yes")
+
+vg_score <- read_delim(here("Data_sources", "datalock", "beataml2_vg_scores_mapped.txt")) %>%
+  mutate(ptid = str_remove(ptid, "pt")) %>%
+  select(lab_id, vg_type, PC1)
+
+colnames(vg_score) <- c( "lab_id","vg_type", "vg_PC1")
+
+# Combine cell type data with RNA expression
+beat_1_4_df <- left_join(group_data, vg_score, by = "lab_id") %>%
+  left_join(pca_vals, by = "lab_id") %>%
+  select(-lab_id) %>% 
+  pivot_longer(cols = PC1, names_to = "PC_number", values_to = "PC_value") %>%
+  group_by(vg_type, PC_number) %>% 
+  nest()
+
+rm(group_data,vg_score)
+
+
+
+cell_type_long <- beat_1_4_df %>%
+  na.omit() %>%
+  mutate(cor_result = map(data, ~ cor.test(.x$PC_value, .x$vg_PC1, method = "spearman", exact = FALSE)),
+         tidy_result = map(cor_result, broom::tidy)) %>%
+  unnest(tidy_result) %>%
+  select(vg_type, PC_number, estimate, p.value) %>%
+  mutate(fdr = p.adjust(p.value, method = "fdr"))
+
+rm(beat_1_4_df)
+
+# Create cell type correlation heatmap
+cell_type_matrix <- cell_type_long %>%
+  select(-p.value, -fdr) %>%  # Exclude p.value, we'll use fdr later
+  pivot_wider(names_from = PC_number, values_from = estimate) %>%
+  rename("m6a Eigengene" = PC1) %>%
+  column_to_rownames(var = "vg_type") %>%
+  as.matrix()
+
+
+fdr_matrix <- cell_type_long %>%
+  select(-estimate, -p.value) %>%
+  pivot_wider(names_from = PC_number, values_from = fdr) %>%
+  column_to_rownames(var = "vg_type") %>%
+  as.matrix()
+
+
+fdr_value_legend <- Legend(
+  labels = c("*** fdr < 0.001", "** fdr < 0.01", "* fdr < 0.05"),
+  legend_gp = gpar(fontsize = 10),
+  title = "P-value Significance",
+  title_gp = gpar(fontsize = 10, fontface = "bold")
+)
+
+annotation_cell <- rowAnnotation(
+    foo = anno_block(
+        gp = gpar(fill = "purple"), # Fill color for the block
+        labels = "Van Galen Cell States", # Label for the block annotation
+        labels_gp = gpar(col = "white", fontsize = 12, fontface = "bold") # Customize label appearance
+    )
+)
+
+color_ramp <- colorRamp2(c(-1, 0, 1), c("navy", "white", "red"))
+
+ht_opt(
+    legend_title_gp = gpar(fontsize = 10, fontface = "bold"), # Make legend title bold
+    legend_labels_gp = gpar(fontsize = 10), # Set legend labels size
+    heatmap_row_names_gp = gpar(fontsize = 10, fontface = "bold"), # Make row names bold
+    heatmap_column_names_gp = gpar(fontsize = 10, fontface = "bold"), # Make column names bold
+    heatmap_column_title_gp = gpar(fontsize = 10, fontface = "bold") # Make column titles bold
+)
+
+fdr_to_stars <- function(fdr) {
+  if (fdr < 0.001) {
+    return("***")
+  } else if (fdr < 0.01) {
+    return("**")
+  } else if (fdr < 0.05) {
+    return("*")
+  } else {
+    return("")
+  }
+}
+
+cell_type_heat <- Heatmap(
+  cell_type_matrix, 
+  name = "Spearman\nCorrelation",
+  col = colorRamp2(c(-1, 0, 1), c("navy", "white", "red")),
+  left_annotation = annotation_cell,
+  width = unit(3, "cm"), 
+  height = unit(6, "cm"), 
+  rect_gp = gpar(col = "white"),
+  row_names_gp = gpar(fontface = "bold"), 
+  column_names_gp = gpar(fontface = "bold"),
+  cluster_columns = FALSE,
+  cluster_rows = FALSE,
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    # Convert p-values to stars and annotate the cells
+    stars <- fdr_to_stars(fdr_matrix[i, j])
+    grid.text(stars, x, y, gp = gpar(fontsize = 10, col = "black"))
+  },
+  heatmap_legend_param = list(
+    title = "Spearman\nCorrelation", 
+    at = c(-1,0, 1),
+    direction = "horizontal",  
+    title_position = "topcenter", 
+    title_gp = gpar(fontsize = 10, fontface = "bold")
+  )
+)
+
+rm(cell_type_long,cell_type_matrix,fdr_matrix)
+
+#Figure 5B: Clinical Variable Heatmaps 
+# Load and filter data
+group_data <- read_tsv(here("Data_sources", "datalock", "beataml_wv1to4_clinical_git_mapped.tsv"), col_names = TRUE) %>% clean_names()
+group_data <- group_data %>% filter(used_manuscript_analyses == "yes")
+beat_1_4_raw <- group_data
+rm(group_data)
+
+# Categorical data
+beat_1_4_cat <- beat_1_4_raw %>% 
+  select(c(lab_id, consensus_sex, is_denovo, is_transformed)) %>%
+  mutate(trans_vs_denovo = ifelse(is_denovo == TRUE, "denovo", ifelse(is_transformed == TRUE, "transformed", NA))) %>%
+  select(-is_denovo, -is_transformed) %>%
+  mutate_at(vars(-lab_id), base::as.factor)
+
+beat_1_4_cat <- beat_1_4_cat %>% 
+  left_join(subset(pca_vals, select = c(lab_id, PC1)), by = "lab_id") %>%
+  pivot_longer(cols = PC1, names_to = "PC_number", values_to = "PC_value") %>%
+  pivot_longer(cols = consensus_sex:trans_vs_denovo, names_to = "clin_measure", values_to = "clin_val") %>%
+  group_by(PC_number, clin_measure) %>%
+  nest() %>%
+  mutate(filtered = map(data, ~filter(., clin_val != "unknown" & !is.na(clin_val))))
+
+# Calculate statistics and FDR in the same step
+cat_regs <- as_tibble(beat_1_4_cat) %>%
+  mutate(fit = map(filtered, ~glm(clin_val ~ PC_value, data = .x, family = "binomial")), 
+         tidied = map(fit, tidy)) %>%
+  unnest(tidied) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(fdr = p.adjust(p.value, method = "fdr")) %>%
+  select(clin_measure, PC_number, statistic, fdr)
+
+# Split into statistic and FDR data frames
+cat_regs_stats <- cat_regs %>%
+  pivot_wider(id_cols = clin_measure, names_from = PC_number, values_from = statistic) %>%
+  remove_rownames() %>%
+  column_to_rownames(var = "clin_measure") %>%
+  rename("m6a Eigengene" = PC1)
+
+cat_regs_fdr <- cat_regs %>%
+  pivot_wider(id_cols = clin_measure, names_from = PC_number, values_from = fdr) %>%
+  remove_rownames() %>%
+  column_to_rownames(var = "clin_measure") %>%
+  rename("m6a Eigengene" = PC1)
+
+rownames(cat_regs_stats) <- c("Sex", "Transformed vs Denovo")
+
+# ELN regression calculation
+eln_cat <- beat_1_4_raw %>% 
+  select(c(lab_id, eln2017)) %>%
+  filter(eln2017 %in% c("Favorable", "Adverse")) %>%
+  mutate(eln2017 = base::as.factor(eln2017)) %>%
+  left_join(subset(pca_vals, select = c(lab_id, PC1)), by = "lab_id") %>%
+  pivot_longer(cols = PC1, names_to = "PC_number", values_to = "PC_value") %>%
+  group_by(PC_number) %>%
+  nest()
+
+eln_reg <- eln_cat %>%
+  mutate(fit = map(data, ~glm(eln2017 ~ PC_value, data = .x, family = "binomial")), 
+         tidied = map(fit, tidy)) %>%
+  unnest(tidied) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(fdr = p.adjust(p.value, method = "fdr")) %>%
+  select(term, PC_number, statistic, fdr)
+
+# Correct renaming process for ELN stats and FDR
+eln_reg_stats <- eln_reg %>%
+  pivot_wider(id_cols = term, names_from = PC_number, values_from = statistic) %>%
+  column_to_rownames(var = "term")
+
+eln_reg_fdr <- eln_reg %>%
+  pivot_wider(id_cols = term, names_from = PC_number, values_from = fdr) %>%
+  column_to_rownames(var = "term")
+
+
+eln_reg_stats <- rename(eln_reg_stats, "m6a Eigengene" = PC1)
+eln_reg_fdr <- rename(eln_reg_fdr, "m6a Eigengene" = PC1)
+# No need to rename directly here unless the column itself is named differently
+rownames(eln_reg_stats)[rownames(eln_reg_stats) == "PC_value"] <- "ELN 2017 Favorable vs Adverse"
+rownames(eln_reg_fdr)[rownames(eln_reg_fdr) == "PC_value"] <- "ELN 2017 Favorable vs Adverse"
+
+
+# Continuous data
+beat_1_4_cont <- beat_1_4_raw %>%
+  select(c(lab_id, percent_neutrophils_in_pb, percent_monocytes_in_pb, age_at_specimen_acquisition, wbc_count, percent_blasts_in_pb)) %>%
+  mutate_at(vars(percent_neutrophils_in_pb:percent_blasts_in_pb), as.numeric)
+
+beat_1_4_cont <- beat_1_4_cont %>%
+  left_join(subset(pca_vals, select = c(lab_id, PC1)), by = "lab_id") %>%
+  pivot_longer(cols = PC1, names_to = "PC_number", values_to = "PC_value") %>%
+  pivot_longer(cols = percent_neutrophils_in_pb:percent_blasts_in_pb, names_to = "clin_measure", values_to = "clin_val") %>%
+  group_by(PC_number, clin_measure) %>%
+  nest()
+
+cont_regs <- as_tibble(beat_1_4_cont) %>%
+  mutate(fit = map(data, ~lm(clin_val ~ PC_value, data = .x)), 
+         tidied = map(fit, tidy)) %>%
+  unnest(tidied) %>%
+  filter(term == "PC_value") %>%
+  mutate(fdr = p.adjust(p.value, method = "fdr")) %>%
+  select(clin_measure, PC_number, statistic, fdr)
+
+# Split into statistic and FDR data frames
+cont_regs_stats <- cont_regs %>%
+  pivot_wider(id_cols = clin_measure, names_from = PC_number, values_from = statistic) %>%
+  remove_rownames() %>%
+  column_to_rownames(var = "clin_measure") %>%
+  rename("m6a Eigengene" = PC1)
+
+cont_regs_fdr <- cont_regs %>%
+  pivot_wider(id_cols = clin_measure, names_from = PC_number, values_from = fdr) %>%
+  remove_rownames() %>%
+  column_to_rownames(var = "clin_measure") %>%
+  rename("m6a Eigengene" = PC1)
+
+rownames(cont_regs_stats) <- c("% Neutrophils (PB)", "% Monocytes (PB)", "Age", "WBC Count", "% Blasts (PB)")
+rownames(cont_regs_fdr) <- c("% Neutrophils (PB)", "% Monocytes (PB)", "Age", "WBC Count", "% Blasts (PB)")
+
+
+
+# Combine all statistics and FDR data
+all_cat_reg_stats <- rbind(eln_reg_stats, cat_regs_stats) %>% as.matrix()
+all_cat_reg_fdr <- rbind(eln_reg_fdr, cat_regs_fdr) %>% as.matrix()
+
+cont_regs_stats <- cont_regs_stats %>% as.matrix()
+cont_regs_fdr <- cont_regs_fdr %>% as.matrix()
+# Create the row annotation for categorical variables
+categorical_annotation <- rowAnnotation(
+  foo = anno_block(
+    gp = gpar(fill = "red"),  # Choose a color for the block
+    labels = "Categorical",
+    labels_gp = gpar(col = "white", fontsize = 12, fontface = "bold")
+  )
+)
+
+# Heatmap for categorical data
+categorical_heat <- Heatmap(
+  all_cat_reg_stats,  # Feed in your matrix
+  name = "T Statistic (Categorical)",
+  column_title_gp = gpar(fontsize = 12, fontface = "bold"),
+  left_annotation = categorical_annotation,
+   width = unit(3, "cm"), 
+  height = unit(3, "cm"),
+  row_names_gp = gpar(fontface = "bold"), 
+  column_names_gp = gpar(fontface = "bold"),
+  heatmap_legend_param = list(
+    title = "T Statistic", 
+    direction = "horizontal", 
+    title_gp = gpar(fontsize = 10, fontface = "bold")
+  ),
+  col = colorRamp2(c(-5, 0, 5), c("blue", "white", "red")),
+  cluster_columns = FALSE,
+  cluster_rows = FALSE,
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    # Add FDR stars
+    stars <- fdr_to_stars(all_cat_reg_fdr[i, j])
+    grid.text(stars, x, y, gp = gpar(fontsize = 10, col = "black"))
+  },
+  show_heatmap_legend = FALSE
+)
+
+continuous_annotation <- rowAnnotation(
+  foo = anno_block(
+    gp = gpar(fill = "orange"),  # Choose a color for the block
+    labels = "BEAT AML Continuous\nClinical Variables",
+    labels_gp = gpar(col = "white", fontsize = 12, fontface = "bold")
+  )
+)
+
+# Heatmap for continuous data
+continuous_heat <- Heatmap(
+  cont_regs_stats,  # Feed in your matrix
+  name = "T Statistic (Continuous)",
+  column_title_gp = gpar(fontsize = 12, fontface = "bold"),
+  width = unit(3, "cm"), 
+  height = unit(5, "cm"),
+  left_annotation = continuous_annotation,
+  row_names_gp = gpar(fontface = "bold"), 
+  column_names_gp = gpar(fontface = "bold"),
+  heatmap_legend_param = list(
+    title = "T Statistic", 
+    direction = "horizontal", 
+    title_gp = gpar(fontsize = 10, fontface = "bold")
+  ),
+  col = colorRamp2(c(-5, 0, 5), c("blue", "white", "red")),
+  cluster_columns = FALSE,
+  cluster_rows = FALSE,
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    # Add FDR stars
+    stars <- fdr_to_stars(cont_regs_fdr[i, j])
+    grid.text(stars, x, y, gp = gpar(fontsize = 10, col = "black"))
+  }
+)
+
+combined_heatmaps <- cell_type_heat %v% categorical_heat %v% continuous_heat
+
+draw(combined_heatmaps, heatmap_legend_side = "bottom")
+# Save the plot
+
+draw(combined_heatmaps, merge_legend = TRUE, heatmap_legend_side = "bottom")
+dev.off()
+
+
+#Figure 5c: Drug AUC vs PCA vals for m6a 
+all_probit_curve <- read_delim(here("Data_sources","datalock", "beataml_probit_v4_nonprop_azd.txt"), col_names = TRUE) %>%  clean_names() %>% subset(select = c(lab_id,inhibitor, auc))
+
+vg_score <- read_delim(here("Data_sources", "datalock", "beataml2_vg_scores_mapped.txt"), col_names = TRUE) %>%  mutate(ptid = str_remove(ptid, "pt")) %>% as_tibble() %>% select(c(lab_id, vg_type, PC1))
+
+colnames(vg_score) <- c("lab_id","vg_type", "vg_PC1" )
+
+vg_adjusted <- vg_score %>%
+  mutate(pc_type = vg_type) %>%  # Treat vg_type as the identifier in pc_type
+  select(lab_id, pc_type, pc_value = vg_PC1)%>% 
+  filter(lab_id %in% pca_vals$lab_id)
+
+m6a_pc1 <- pca_vals %>% select(c(lab_id,PC1)) %>% mutate(pc_type = "PC1") %>%  # Set "PC1" as the identifier for the PCA values
+  select(lab_id, pc_type, pc_value = PC1) 
+
+combined_scores <- bind_rows(vg_adjusted, m6a_pc1)
+
+drug_data_combined <- combined_scores %>%
+  right_join(all_probit_curve, by = "lab_id") %>% 
+  na.omit()
+
+
+nested_data <- drug_data_combined %>%
+  group_by(inhibitor, pc_type) %>%
+  nest()
+
+nested_data_filtered <- nested_data %>%
+  mutate(row_count = map_int(data, nrow)) %>%
+  filter(row_count >= 5)
+
+
+pc_all_reg <- as_tibble(nested_data_filtered) %>% 
+  na.omit() %>%  
+  mutate(test = map(data, ~cor.test(.x$auc, .x$pc_value, method = "spearman", exact = FALSE)), tidied = map(test, tidy)) %>% 
+  unnest(tidied) %>% 
+  subset(select=c(inhibitor, pc_type, estimate, p.value)) %>%
+  mutate(fdr = p.adjust(p.value, method = "fdr")) %>% 
+  select(-p.value)
+
+pc_all_reg <- pc_all_reg %>%
+  pivot_wider(id_cols = inhibitor, names_from = pc_type, values_from = c(estimate, fdr))
+
+m6a_pc_full_df <- pc_all_reg %>% 
+  na.omit() %>% 
+  filter_at(vars (contains("fdr")), any_vars((. <.05 ))) %>% 
+  filter_at(vars (contains("estimate")), all_vars((.!=1 ))) %>% 
+  filter_at(vars (contains("estimate")), all_vars((.!=-1 )))
+
+
+select_drugs <- read_csv(here("Data_sources", "drug list for heat maps condensed.csv"), col_names = TRUE) %>% na.omit()
+
+
+
+m6a_estimates<- m6a_pc_full_df %>%
+  select(inhibitor, contains("estimate")) 
+
+names(m6a_estimates) <-  c("inhibitor","HSC-like","Progenitor-like","GMP-like", "ProMono-like","Monocyte-like", "cDC-like", "m6a Eigengene")
+
+m6a_fdrs <- m6a_pc_full_df %>%
+  select(inhibitor, contains("fdr"))
+
+names(m6a_fdrs) <- c("inhibitor", "HSC-like", "Progenitor-like", "GMP-like", "ProMono-like", "Monocyte-like", "cDC-like", "m6a Eigengene")
+
+
+
+m6a_estimates_matrix <- m6a_estimates %>%
+  filter(inhibitor %in% select_drugs$inhibitor) %>%
+  remove_rownames() %>%
+  column_to_rownames(var = "inhibitor") %>%
+  as.matrix() %>%
+  t()
+
+m6a_fdrs_matrix <- m6a_fdrs %>%
+  filter(inhibitor %in% select_drugs$inhibitor) %>%
+  remove_rownames() %>%
+  column_to_rownames(var = "inhibitor") %>%
+  as.matrix() %>%
+  t()
+
+m6a_drug_heat <- Heatmap(
+  m6a_estimates_matrix, 
+  name = "Spearman\nCorrelation",
+  col = colorRamp2(c(-1, 0, 1), c("navy", "white", "red")),
+  width = unit(10, "cm"),
+  height = unit(6, "cm"),
+  rect_gp = gpar(col = "white"),
+  cluster_columns = TRUE,
+  cluster_rows = TRUE,
+  heatmap_legend_param = list(
+    title = "Spearman\nCorrelation", 
+    at = c(-1,-.5, 0,.5, 1),
+    labels = c("Resistant","","","","Sensitive"),
+    direction = "horizontal",  
+    title_position = "topcenter", 
+    title_gp = gpar(fontsize = 12, fontface = "bold")
+  ),
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    # Add the significance stars based on the FDR values
+    stars <- fdr_to_stars(m6a_fdrs_matrix[i, j])
+    grid.text(stars, x, y, gp = gpar(fontsize = 10, col = "black"))
+  }
+)
+
+draw(m6a_drug_heat)
+png(here("Jackson_Messy_Code", "Final Figures", "m6a Drug Heat.png"), units = "in", height = 7, width = 9, res = 600)
+plot(m6a_drug_heat)
+
+dev.off()
+```
+
+
+Figure 6 Code NURD Figure 
+```{r}
+#Figure 6a: NURD PCA Biplot
+raw_protein_df <- read_delim(here("Data_sources","datalock","proteomics_syn25808020_20220727_long.txt"), col_names = TRUE) %>%  clean_names() %>% pivot_longer(cols = 2:7085, names_to = "gene", values_to = "expression")
+
+raw_protein_df$gene <- raw_protein_df$gene %>% toupper()
+
+NURD_complex <- c("CHD3", "HDAC1", "CHD5", "MBD2", "MBD3", "MTA1", "MTA2", "MTA3", "RBBP4","RBBP7","ZMYND8")
+
+
+
+pro_matrix <- raw_protein_df %>% 
+  filter(gene %in% NURD_complex) %>% 
+  select(gene, lab_id, expression) %>% 
+  pivot_wider(id_cols = c("lab_id"), names_from = gene, values_from = expression)
+
+pro_mat <- pro_matrix %>%  remove_rownames() %>% column_to_rownames(var = "lab_id")
+
+
+nurd_fullpca <- prcomp(pro_mat, center = TRUE, scale = TRUE)
+
+
+
+
+pca_vals<- nurd_fullpca$x %>% as.data.frame() %>%  rownames_to_column(var = "lab_id")
+
+dat <- facto_summarize(nurd_fullpca, element = "var", axes = c(1, 2), result = c("coord", "contrib", "cos2") )
+
+fviz_pca_var(
+  nurd_fullpca, 
+  geom = "arrow",
+  alpha.var = 0.7,
+   col.var = "contrib",
+    jitter = list(width = 0.02, height = 0.02), 
+  circle = FALSE,
+  gradient.cols = c("blue", "red"),
+    legend.title = list(color = "Contribution (%)"),
+ ggtheme = theme_prism(base_size = 6)
+) +
+  geom_text_repel(
+        data = dat,
+        aes(x = Dim.1, y = Dim.2, label = name),
+        parse = TRUE,
+        size = 3, 
+        label.padding = .1
+    )+
+  labs(title = "NURD Protein PCA")+
+   theme( axis.line = element_blank(),
+         legend.text = element_text(face = "bold"),
+      legend.title = element_text(face = "bold"),
+      legend.position = "bottom")
+
+#Figure 6B: NURD Clinical Heatmaps
+# Load and filter cell type data
+group_data <- read_tsv(here("Data_sources", "datalock", "beataml_wv1to4_clinical_git_mapped.tsv")) %>% 
+  clean_names() %>% 
+  filter(used_manuscript_analyses == "yes")
+
+vg_score <- read_delim(here("Data_sources", "datalock", "beataml2_vg_scores_mapped.txt")) %>% 
+  mutate(ptid = str_remove(ptid, "pt")) %>% 
+  select(lab_id, vg_type, PC1)
+
+colnames(vg_score) <- c("lab_id", "vg_type", "vg_PC1")
+
+# Combine cell type data with RNA expression
+beat_1_4_df <- left_join(group_data, vg_score, by = "lab_id") %>%
+  left_join(pca_vals, by = "lab_id") %>%
+  select(-lab_id) %>% 
+  pivot_longer(cols = PC1, names_to = "PC_number", values_to = "PC_value") %>%
+  group_by(vg_type, PC_number) %>%
+  nest()
+
+cell_type_long <- beat_1_4_df %>%
+  na.omit() %>%
+  mutate(cor_result = map(data, ~cor.test(.x$PC_value, .x$vg_PC1, method = "spearman", exact = FALSE)),
+         tidy_result = map(cor_result, broom::tidy)) %>%
+  unnest(tidy_result) %>%
+  select(vg_type, PC_number, estimate, p.value) %>%
+  mutate(fdr = p.adjust(p.value, method = "fdr"))
+
+# Create cell type correlation heatmap
+cell_type_matrix <- cell_type_long %>%
+  select(-p.value, -fdr) %>%
+  pivot_wider(names_from = PC_number, values_from = estimate) %>%
+  rename("NURD Eigengene" = PC1) %>%
+  column_to_rownames(var = "vg_type") %>%
+  as.matrix()
+
+fdr_matrix <- cell_type_long %>%
+  select(-estimate, -p.value) %>%
+  pivot_wider(names_from = PC_number, values_from = fdr) %>%
+  column_to_rownames(var = "vg_type") %>%
+  as.matrix()
+
+fdr_value_legend <- Legend(
+  labels = c("*** fdr < 0.001", "** fdr < 0.01", "* fdr < 0.05"),
+  legend_gp = gpar(fontsize = 10),
+  title = "P-value Significance",
+  title_gp = gpar(fontsize = 10, fontface = "bold")
+)
+
+annotation_cell <- rowAnnotation(
+  foo = anno_block(
+    gp = gpar(fill = "purple"),
+    labels = "Van Galen Cell States",
+    labels_gp = gpar(col = "white", fontsize = 12, fontface = "bold")
+  )
+)
+
+color_ramp <- colorRamp2(c(-1, 0, 1), c("navy", "white", "red"))
+
+ht_opt(
+  legend_title_gp = gpar(fontsize = 10, fontface = "bold"),
+  legend_labels_gp = gpar(fontsize = 10),
+  heatmap_row_names_gp = gpar(fontsize = 10, fontface = "bold"),
+  heatmap_column_names_gp = gpar(fontsize = 10, fontface = "bold"),
+  heatmap_column_title_gp = gpar(fontsize = 10, fontface = "bold")
+)
+
+cell_type_heat <- Heatmap(
+  cell_type_matrix, 
+  name = "Spearman\nCorrelation",
+  col = colorRamp2(c(-1, 0, 1), c("navy", "white", "red")),
+  left_annotation = annotation_cell,
+  width = unit(3, "cm"), 
+  height = unit(6, "cm"),
+  rect_gp = gpar(col = "white"),
+  row_names_gp = gpar(fontface = "bold"),
+  column_names_gp = gpar(fontface = "bold"),
+  cluster_columns = FALSE,
+  cluster_rows = FALSE,
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    stars <- fdr_to_stars(fdr_matrix[i, j])
+    grid.text(stars, x, y, gp = gpar(fontsize = 10, col = "black"))
+  },
+  heatmap_legend_param = list(
+    title = "Spearman\nCorrelation", 
+    at = c(-1, 0, 1),
+    direction = "horizontal",  
+    title_position = "topcenter", 
+    title_gp = gpar(fontsize = 10, fontface = "bold")
+  )
+)
+# Load and filter data
+group_data <- read_tsv(here("Data_sources", "datalock", "beataml_wv1to4_clinical_git_mapped.tsv"), col_names = TRUE) %>% clean_names()
+group_data <- group_data %>% filter(used_manuscript_analyses == "yes")
+beat_1_4_raw <- group_data
+rm(group_data)
+
+# Categorical data
+beat_1_4_cat <- beat_1_4_raw %>% 
+  select(c(lab_id, consensus_sex, is_denovo, is_transformed)) %>%
+  mutate(trans_vs_denovo = ifelse(is_denovo == TRUE, "denovo", ifelse(is_transformed == TRUE, "transformed", NA))) %>%
+  select(-is_denovo, -is_transformed) %>%
+  mutate_at(vars(-lab_id), as.factor)
+
+beat_1_4_cat <- beat_1_4_cat %>% 
+  left_join(subset(pca_vals, select = c(lab_id, PC1)), by = "lab_id") %>%
+  pivot_longer(cols = PC1, names_to = "PC_number", values_to = "PC_value") %>%
+  pivot_longer(cols = consensus_sex:trans_vs_denovo, names_to = "clin_measure", values_to = "clin_val") %>%
+  group_by(PC_number, clin_measure) %>%
+  nest() %>%
+  mutate(filtered = map(data, ~filter(., clin_val != "unknown" & !is.na(clin_val))))
+
+# Calculate statistics and FDR in the same step
+cat_regs <- as_tibble(beat_1_4_cat) %>%
+  mutate(fit = map(filtered, ~glm(clin_val ~ PC_value, data = .x, family = "binomial")), 
+         tidied = map(fit, tidy)) %>%
+  unnest(tidied) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(fdr = p.adjust(p.value, method = "fdr")) %>%
+  select(clin_measure, PC_number, statistic, fdr)
+
+# Split into statistic and FDR data frames
+cat_regs_stats <- cat_regs %>%
+  pivot_wider(id_cols = clin_measure, names_from = PC_number, values_from = statistic) %>%
+  remove_rownames() %>%
+  column_to_rownames(var = "clin_measure") %>%
+  rename("NURD Eigengene" = PC1)
+
+cat_regs_fdr <- cat_regs %>%
+  pivot_wider(id_cols = clin_measure, names_from = PC_number, values_from = fdr) %>%
+  remove_rownames() %>%
+  column_to_rownames(var = "clin_measure") %>%
+  rename("NURD Eigengene" = PC1)
+
+rownames(cat_regs_stats) <- c("Sex", "Transformed vs Denovo")
+
+# ELN regression calculation
+eln_cat <- beat_1_4_raw %>% 
+  select(c(lab_id, eln2017)) %>%
+  filter(eln2017 %in% c("Favorable", "Adverse")) %>%
+  mutate(eln2017 = as.factor(eln2017)) %>%
+  left_join(subset(pca_vals, select = c(lab_id, PC1)), by = "lab_id") %>%
+  pivot_longer(cols = PC1, names_to = "PC_number", values_to = "PC_value") %>%
+  group_by(PC_number) %>%
+  nest()
+
+eln_reg <- eln_cat %>%
+  mutate(fit = map(data, ~glm(eln2017 ~ PC_value, data = .x, family = "binomial")), 
+         tidied = map(fit, tidy)) %>%
+  unnest(tidied) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(fdr = p.adjust(p.value, method = "fdr")) %>%
+  select(term, PC_number, statistic, fdr)
+
+# Correct renaming process for ELN stats and FDR
+eln_reg_stats <- eln_reg %>%
+  pivot_wider(id_cols = term, names_from = PC_number, values_from = statistic) %>%
+  column_to_rownames(var = "term")
+
+eln_reg_fdr <- eln_reg %>%
+  pivot_wider(id_cols = term, names_from = PC_number, values_from = fdr) %>%
+  column_to_rownames(var = "term")
+
+
+eln_reg_stats <- rename(eln_reg_stats, "NURD Eigengene" = PC1)
+eln_reg_fdr <- rename(eln_reg_fdr, "NURD Eigengene" = PC1)
+rownames(eln_reg_stats)[rownames(eln_reg_stats) == "PC_value"] <- "ELN 2017 Favorable vs Adverse"
+rownames(eln_reg_fdr)[rownames(eln_reg_fdr) == "PC_value"] <- "ELN 2017 Favorable vs Adverse"
+
+# Continuous data
+beat_1_4_cont <- beat_1_4_raw %>%
+  select(c(lab_id, percent_neutrophils_in_pb, percent_monocytes_in_pb, age_at_specimen_acquisition, wbc_count, percent_blasts_in_pb)) %>%
+  mutate_at(vars(percent_neutrophils_in_pb:percent_blasts_in_pb), as.numeric)
+
+beat_1_4_cont <- beat_1_4_cont %>%
+  left_join(subset(pca_vals, select = c(lab_id, PC1)), by = "lab_id") %>%
+  pivot_longer(cols = PC1, names_to = "PC_number", values_to = "PC_value") %>%
+  pivot_longer(cols = percent_neutrophils_in_pb:percent_blasts_in_pb, names_to = "clin_measure", values_to = "clin_val") %>%
+  group_by(PC_number, clin_measure) %>%
+  nest()
+
+cont_regs <- as_tibble(beat_1_4_cont) %>%
+  mutate(fit = map(data, ~lm(clin_val ~ PC_value, data = .x)), 
+         tidied = map(fit, tidy)) %>%
+  unnest(tidied) %>%
+  filter(term == "PC_value") %>%
+  mutate(fdr = p.adjust(p.value, method = "fdr")) %>%
+  select(clin_measure, PC_number, statistic, fdr)
+
+# Split into statistic and FDR data frames
+cont_regs_stats <- cont_regs %>%
+  pivot_wider(id_cols = clin_measure, names_from = PC_number, values_from = statistic) %>%
+  remove_rownames() %>%
+  column_to_rownames(var = "clin_measure") %>%
+  rename("NURD Eigengene" = PC1)
+
+cont_regs_fdr <- cont_regs %>%
+  pivot_wider(id_cols = clin_measure, names_from = PC_number, values_from = fdr) %>%
+  remove_rownames() %>%
+  column_to_rownames(var = "clin_measure") %>%
+  rename("NURD Eigengene" = PC1)
+
+rownames(cont_regs_stats) <- c("% Neutrophils (PB)", "% Monocytes (PB)", "Age", "WBC Count", "% Blasts (PB)")
+rownames(cont_regs_fdr) <- c("% Neutrophils (PB)", "% Monocytes (PB)", "Age", "WBC Count", "% Blasts (PB)")
+
+# Combine all statistics and FDR data
+all_cat_reg_stats <- rbind(eln_reg_stats, cat_regs_stats) %>% as.matrix()
+all_cat_reg_fdr <- rbind(eln_reg_fdr, cat_regs_fdr) %>% as.matrix()
+
+cont_regs_stats <- cont_regs_stats %>% as.matrix()
+cont_regs_fdr <- cont_regs_fdr %>% as.matrix()
+
+# Create the row annotation for categorical variables
+categorical_annotation <- rowAnnotation(
+  foo = anno_block(
+    gp = gpar(fill = "red"),  # Choose a color for the block
+    labels = "Categorical",
+    labels_gp = gpar(col = "white", fontsize = 12, fontface = "bold")
+  )
+)
+
+# Heatmap for categorical data
+categorical_heat <- Heatmap(
+  all_cat_reg_stats,  # Feed in your matrix
+  name = "T or Z Statistic (Categorical)",
+  column_title_gp = gpar(fontsize = 12, fontface = "bold"),
+  left_annotation = categorical_annotation,
+   width = unit(3, "cm"), 
+  height = unit(3, "cm"),
+  row_names_gp = gpar(fontface = "bold"), 
+  column_names_gp = gpar(fontface = "bold"),
+  heatmap_legend_param = list(
+    title = "T or Z Statistic", 
+    direction = "horizontal", 
+    title_gp = gpar(fontsize = 10, fontface = "bold")
+  ),
+  col = colorRamp2(c(-5, 0, 5), c("blue", "white", "red")),
+  cluster_columns = FALSE,
+  cluster_rows = FALSE,
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    # Add FDR stars
+    stars <- fdr_to_stars(all_cat_reg_fdr[i, j])
+    grid.text(stars, x, y, gp = gpar(fontsize = 10, col = "black"))
+  },
+  show_heatmap_legend = FALSE
+)
+
+continuous_annotation <- rowAnnotation(
+  foo = anno_block(
+    gp = gpar(fill = "orange"),  # Choose a color for the block
+    labels = "BEAT AML Continuous\nClinical Variables",
+    labels_gp = gpar(col = "white", fontsize = 12, fontface = "bold")
+  )
+)
+
+# Heatmap for continuous data
+continuous_heat <- Heatmap(
+  cont_regs_stats,  # Feed in your matrix
+  name = "T or Z Statistic (Continuous)",
+  column_title_gp = gpar(fontsize = 12, fontface = "bold"),
+  width = unit(3, "cm"), 
+  height = unit(5, "cm"),
+  left_annotation = continuous_annotation,
+  row_names_gp = gpar(fontface = "bold"), 
+  column_names_gp = gpar(fontface = "bold"),
+  heatmap_legend_param = list(
+    title = "T or Z Statistic", 
+    direction = "horizontal", 
+    title_gp = gpar(fontsize = 10, fontface = "bold")
+  ),
+  col = colorRamp2(c(-5, 0, 5), c("blue", "white", "red")),
+  cluster_columns = FALSE,
+  cluster_rows = FALSE,
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    # Add FDR stars
+    stars <- fdr_to_stars(cont_regs_fdr[i, j])
+    grid.text(stars, x, y, gp = gpar(fontsize = 10, col = "black"))
+  }
+)
+
+combined_heatmaps <- cell_type_heat %v% categorical_heat %v% continuous_heat
+
+draw(combined_heatmaps, heatmap_legend_side = "bottom")
+
+
+draw(combined_heatmaps, merge_legend = TRUE, heatmap_legend_side = "bottom")
+dev.off()
+
+
+#Figure 6C: Drug NURD Heatmaps
+all_probit_curve <- read_delim(here("Data_sources", "datalock", "beataml_probit_v4_nonprop_azd.txt"), col_names = TRUE) %>% 
+  clean_names() %>% 
+  subset(select = c(lab_id, inhibitor, auc))
+
+
+select_drugs <- read_csv(here("Data_sources", "drug list for heat maps condensed.csv"), col_names = TRUE) %>% 
+  na.omit()
+
+
+all_probit_curve <- all_probit_curve %>% filter(inhibitor %in% select_drugs$inhibitor)
+
+vg_score <- read_delim(here("Data_sources", "datalock", "beataml2_vg_scores_mapped.txt"), col_names = TRUE) %>% 
+  mutate(ptid = str_remove(ptid, "pt")) %>% 
+  as_tibble() %>% 
+  select(c(lab_id, vg_type, PC1))
+
+colnames(vg_score) <- c("lab_id", "vg_type", "vg_PC1")
+
+vg_adjusted <- vg_score %>%
+  mutate(pc_type = vg_type) %>% 
+  select(lab_id, pc_type, pc_value = vg_PC1) %>% 
+  filter(lab_id %in% pca_vals$lab_id)
+
+nurd_pc1 <- pca_vals %>% 
+  select(c(lab_id, PC1)) %>% 
+  mutate(pc_type = "PC1") %>% 
+  select(lab_id, pc_type, pc_value = PC1)
+
+combined_scores <- bind_rows(vg_adjusted, nurd_pc1)
+
+drug_data_combined <- combined_scores %>%
+  right_join(all_probit_curve, by = "lab_id") %>% 
+  na.omit()
+
+nested_data <- drug_data_combined %>%
+  group_by(inhibitor, pc_type) %>%
+  nest()
+
+nested_data_filtered <- nested_data %>%
+  mutate(row_count = map_int(data, nrow)) %>%
+  filter(row_count >= 5)
+
+pc_all_reg <- as_tibble(nested_data_filtered) %>%
+  na.omit() %>%
+  mutate(test = map(data, ~cor.test(.x$auc, .x$pc_value, method = "spearman", exact = FALSE)), 
+         tidied = map(test, tidy)) %>% 
+  unnest(tidied) %>% 
+  subset(select = c(inhibitor, pc_type, estimate, p.value)) %>%
+  mutate(fdr = p.adjust(p.value, method = "fdr")) %>% 
+  select(-p.value)
+
+pc_all_reg <- pc_all_reg %>%
+  pivot_wider(id_cols = inhibitor, names_from = pc_type, values_from = c(estimate, fdr))
+
+nurd_pc_full_df <- pc_all_reg %>% 
+  na.omit() %>% 
+  filter_at(vars(contains("fdr")), any_vars((. < 0.05))) %>% 
+  filter_at(vars(contains("estimate")), all_vars((. != 1))) %>% 
+  filter_at(vars(contains("estimate")), all_vars((. != -1)))
+
+select_drugs <- read_csv(here("Data_sources", "drug list for heat maps condensed.csv"), col_names = TRUE) %>% 
+  na.omit()
+
+nurd_estimates <- nurd_pc_full_df %>%
+  select(inhibitor, contains("estimate"))
+
+names(nurd_estimates) <- c("inhibitor", "HSC-like", "Progenitor-like", "GMP-like", "ProMono-like", "Monocyte-like", "cDC-like", "NURD Eigengene")
+
+nurd_fdrs <- nurd_pc_full_df %>%
+  select(inhibitor, contains("fdr"))
+
+names(nurd_fdrs) <- c("inhibitor", "HSC-like", "Progenitor-like", "GMP-like", "ProMono-like", "Monocyte-like", "cDC-like", "NURD Eigengene")
+
+fdr_to_stars <- function(fdr) {
+  if (fdr < 0.001) {
+    return("***")
+  } else if (fdr < 0.01) {
+    return("**")
+  } else if (fdr < 0.05) {
+    return("*")
+  } else {
+    return("")
+  }
+}
+
+nurd_estimates_matrix <- nurd_estimates %>%
+  filter(inhibitor %in% select_drugs$inhibitor) %>%
+  remove_rownames() %>%
+  column_to_rownames(var = "inhibitor") %>%
+  as.matrix() %>%
+  t()
+
+nurd_fdrs_matrix <- nurd_fdrs %>%
+  filter(inhibitor %in% select_drugs$inhibitor) %>%
+  remove_rownames() %>%
+  column_to_rownames(var = "inhibitor") %>%
+  as.matrix() %>%
+  t()
+
+nurd_drug_heat <- Heatmap(
+  nurd_estimates_matrix, 
+  name = "Spearman\nCorrelation",
+  col = colorRamp2(c(-1, 0, 1), c("navy", "white", "red")),
+  width = unit(10, "cm"),
+  height = unit(6, "cm"),
+  rect_gp = gpar(col = "white"),
+  cluster_columns = TRUE,
+  cluster_rows = TRUE,
+  heatmap_legend_param = list(
+    title = "Spearman\nCorrelation", 
+    at = c(-1, 0, 1),
+    direction = "horizontal",  
+    title_position = "topcenter", 
+    title_gp = gpar(fontsize = 12, fontface = "bold")
+  ),
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    stars <- fdr_to_stars(nurd_fdrs_matrix[i, j])
+    grid.text(stars, x, y, gp = gpar(fontsize = 10, col = "black"))
+  }
+)
+
+draw(nurd_drug_heat)
+
+plot(nurd_drug_heat)
+
+dev.off()
+```
+
